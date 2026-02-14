@@ -14,6 +14,9 @@ import { z } from "zod";
 const REQUIRED_SECTION_NAMES = ["waiting", "next", "later", "someday"] as const;
 const REQUIRED_LABEL_NAMES = ["clarify", "quick", "errand"] as const;
 const OPENAI_MODEL = "gpt-5.2";
+const APP_TITLE = `|._ |_  _ _|_
+|| ||_)(_) | 
+Todoist Organizer`;
 
 type RequiredSectionName = (typeof REQUIRED_SECTION_NAMES)[number];
 type SectionLogRecord = Record<
@@ -81,6 +84,9 @@ void main();
  * @returns Resolves when startup work has completed.
  */
 async function main(): Promise<void> {
+  console.log(APP_TITLE);
+  console.log("");
+
   const todoistApiKey = getRequiredEnvVar("TODOIST_API_KEY");
   const targetProjectName = getRequiredEnvVar("TODOIST_TARGET_PROJECT_NAME");
   const referencesProjectName = getRequiredEnvVar("TODOIST_REFERENCES_PROJECT_NAME");
@@ -194,50 +200,24 @@ async function run(
 
   const shoppingProjectId = shoppingProject.id;
 
-  console.log("");
-  console.log(`Shopping project: ${shoppingProject.name} (${shoppingProjectId})`);
-
   const sectionsResponse = await api.getSections({
     projectId: targetProject.id,
   });
   const sectionRecord = buildSectionRecord(sectionsResponse.results);
   assertRequiredSectionsExist(sectionRecord);
 
-  console.log("");
-  console.log(`Project: ${targetProject.name} (${targetProject.id})`);
-  console.log("Tracked sections:");
-
-  REQUIRED_SECTION_NAMES.forEach((sectionName) => {
-    const section = sectionRecord[sectionName];
-    console.log(`Section: ${section.name} (${section.id})`);
-  });
-
-  console.log("Section record:");
-  console.log(JSON.stringify(sectionRecord, null, 2));
-
   const labelsResponse = await api.getLabels();
   const labelRecord = buildLabelRecord(labelsResponse.results);
   assertRequiredLabelsExist(labelRecord);
 
-  console.log("");
-  console.log("Tracked labels:");
-
-  REQUIRED_LABEL_NAMES.forEach((labelName) => {
-    const label = labelRecord[labelName];
-    console.log(`Label: ${label.name} (${label.id})`);
-  });
-
-  console.log("Label record:");
-  console.log(JSON.stringify(labelRecord, null, 2));
+  console.log("Loaded projects, sections, and labels.");
 
   const referencesTasksResponse = await api.getTasks({
     projectId: referencesProject.id,
   });
   const referenceNotesRecord = buildReferenceNotesRecord(referencesTasksResponse.results);
   const referencesYaml = stringifyYaml(referenceNotesRecord);
-
-  console.log("Reference notes:");
-  console.log(referencesYaml);
+  console.log(`Loaded ${referenceNotesRecord.reference_notes.length} references.`);
 
   const tasksResponse = await api.getTasks({ projectId: inboxProject.id });
   const actionableInboxTasks = tasksResponse.results.filter(
@@ -246,15 +226,18 @@ async function run(
   const inboxTaskRecord = buildInboxTaskRecord(actionableInboxTasks);
   const inboxTasksYaml = stringifyYaml(inboxTaskRecord);
 
-  console.log("Inbox tasks:");
-  console.log(inboxTasksYaml);
+  console.log(`Loaded ${actionableInboxTasks.length} inbox tasks.`);
 
   if (actionableInboxTasks.length === 0) {
     console.log("No actionable inbox tasks found.");
     return;
   }
 
+  console.log("Inbox task IDs:");
+  console.log(formatTaskIdList(actionableInboxTasks.map((task) => task.id)));
+
   const systemPrompt = await loadSystemPrompt();
+  console.log("Sending request to GPT...");
   const organizerOutput = await requestTaskOrganization(
     openaiApiKey,
     systemPrompt,
@@ -262,9 +245,7 @@ async function run(
     inboxTasksYaml,
   );
 
-  console.log("");
-  console.log("LLM structured output:");
-  console.log(JSON.stringify(organizerOutput, null, 2));
+  console.log("Response received, parsing and processing...");
 
   await applyOrganizerOutput({
     api,
@@ -350,6 +331,10 @@ async function applyOrganizerOutput(args: OrganizerApplyArgs): Promise<void> {
 
   validateOrganizerOutput(organizerOutput, taskMap);
 
+  console.log(
+    `Applying actions: ${organizerOutput.to_move.length} to_move, ${organizerOutput.shopping.length} shopping, ${organizerOutput.needs_clarification.length} clarification.`,
+  );
+
   for (const toMoveTask of organizerOutput.to_move) {
     const task = getTaskFromMap(taskMap, toMoveTask.id);
     await applyToMoveAction({
@@ -380,6 +365,8 @@ async function applyOrganizerOutput(args: OrganizerApplyArgs): Promise<void> {
       clarifyLabelName,
     });
   }
+
+  console.log("All tasks moved!");
 }
 
 /**
@@ -455,6 +442,8 @@ async function applyToMoveAction(args: {
   const labelsToAdd = toMoveTask.add_labels ?? [];
   const mergedLabels = mergeLabels(task.labels, labelsToAdd);
 
+  console.log(`Moving task ID ${task.id} to ${finalSection}.`);
+
   if (finalSection === "no_section") {
     await api.moveTask(task.id, { projectId: targetProjectId });
   } else {
@@ -488,6 +477,8 @@ async function applyShoppingAction(args: {
   const { api, task, shoppingTask, shoppingProjectId } = args;
   const shoppingTitle = capitalizeFirstLetter(shoppingTask.title.trim());
 
+  console.log(`Moving task ID ${task.id} to shopping project.`);
+
   await api.moveTask(task.id, { projectId: shoppingProjectId });
   await api.updateTask(task.id, { content: shoppingTitle });
 
@@ -510,6 +501,8 @@ async function applyClarificationAction(args: {
 }): Promise<void> {
   const { api, task, clarificationTask, clarifyLabelName } = args;
   const mergedLabels = mergeLabels(task.labels, [clarifyLabelName]);
+
+  console.log(`Requesting clarification for task ID ${task.id}.`);
 
   await api.updateTask(task.id, { labels: mergedLabels });
 
@@ -667,6 +660,19 @@ function capitalizeFirstLetter(value: string): string {
   }
 
   return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+/**
+ * Formats task IDs as a multi-line list.
+ * @param ids - Task IDs to include in logs.
+ * @returns A bullet-style ID list.
+ */
+function formatTaskIdList(ids: string[]): string {
+  if (ids.length === 0) {
+    return "none";
+  }
+
+  return ids.map((id) => `- ${id}`).join("\n");
 }
 
 /**
