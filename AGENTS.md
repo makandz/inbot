@@ -1,0 +1,3 @@
+- When writing functions, include JSDoc with @param and @returns.
+- JSDoc @param entries should use a dash before the description (for example: `@param value - Description`).
+- You do not need to run the app with `npm run start` or anything. Assume somebody else will run it in a different terminal.
