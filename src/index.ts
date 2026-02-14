@@ -1,16 +1,61 @@
-import "dotenv/config";
+import type {
+  Label,
+  Section,
+  Task as TodoistTask,
+} from "@doist/todoist-api-typescript";
 import { TodoistApi } from "@doist/todoist-api-typescript";
-import type { Label, Section } from "@doist/todoist-api-typescript";
+import "dotenv/config";
+import { readFile } from "node:fs/promises";
+import OpenAI from "openai";
+import { zodTextFormat } from "openai/helpers/zod";
+import { stringify as stringifyYaml } from "yaml";
+import { z } from "zod";
 
 const REQUIRED_SECTION_NAMES = ["waiting", "next", "later", "someday"] as const;
 const REQUIRED_LABEL_NAMES = ["clarify", "quick", "errand"] as const;
+const OPENAI_MODEL = "gpt-5.2";
 
 type RequiredSectionName = (typeof REQUIRED_SECTION_NAMES)[number];
-type SectionLogRecord = Record<RequiredSectionName, { id: string; name: string } | null>;
-type CompleteSectionRecord = Record<RequiredSectionName, { id: string; name: string }>;
+type SectionLogRecord = Record<
+  RequiredSectionName,
+  { id: string; name: string } | null
+>;
+type CompleteSectionRecord = Record<
+  RequiredSectionName,
+  { id: string; name: string }
+>;
 type RequiredLabelName = (typeof REQUIRED_LABEL_NAMES)[number];
-type LabelLogRecord = Record<RequiredLabelName, { id: string; name: string } | null>;
-type CompleteLabelRecord = Record<RequiredLabelName, { id: string; name: string }>;
+type LabelLogRecord = Record<
+  RequiredLabelName,
+  { id: string; name: string } | null
+>;
+type CompleteLabelRecord = Record<
+  RequiredLabelName,
+  { id: string; name: string }
+>;
+
+const OrganizerOutputSchema = z.object({
+  to_move: z.array(
+    z.object({
+      id: z.string(),
+      section: z.enum(["no_section", "next", "later", "someday", "waiting"]),
+      title: z.string().min(1),
+      add_labels: z.array(z.enum(["quick", "errand"])).nullable(),
+      priority: z
+        .union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)])
+        .nullable(),
+      description: z.string().nullable(),
+    }),
+  ),
+  needs_clarification: z.array(
+    z.object({
+      id: z.string(),
+      question: z.string().min(1).max(140),
+    }),
+  ),
+});
+
+type OrganizerOutput = z.infer<typeof OrganizerOutputSchema>;
 
 void main();
 
@@ -21,14 +66,15 @@ void main();
 async function main(): Promise<void> {
   const todoistApiKey = getRequiredEnvVar("TODOIST_API_KEY");
   const targetProjectName = getRequiredEnvVar("TODOIST_TARGET_PROJECT_NAME");
+  const openaiApiKey = getRequiredEnvVar("OPENAI_API_KEY");
 
-  if (!todoistApiKey || !targetProjectName) {
+  if (!todoistApiKey || !targetProjectName || !openaiApiKey) {
     process.exitCode = 1;
     return;
   }
 
   try {
-    await run(todoistApiKey, targetProjectName);
+    await run(todoistApiKey, targetProjectName, openaiApiKey);
   } catch (error: unknown) {
     console.error(formatErrorMessage(error));
     process.exitCode = 1;
@@ -68,9 +114,14 @@ function getRequiredEnvVar(variableName: string): string | undefined {
  * Fetches inbox tasks and target project details from Todoist.
  * @param apiKey - Todoist API token.
  * @param projectName - Name of the project where organized tasks will be placed.
+ * @param openaiApiKey - OpenAI API key used for task organization output.
  * @returns Resolves when all task and project details have been printed.
  */
-async function run(apiKey: string, projectName: string): Promise<void> {
+async function run(
+  apiKey: string,
+  projectName: string,
+  openaiApiKey: string,
+): Promise<void> {
   const api = new TodoistApi(apiKey);
 
   const projectsResponse = await api.getProjects();
@@ -91,16 +142,15 @@ async function run(apiKey: string, projectName: string): Promise<void> {
   }
 
   const tasksResponse = await api.getTasks({ projectId: inboxProject.id });
+  const inboxTaskRecord = buildInboxTaskRecord(tasksResponse.results);
+  const inboxTasksYaml = stringifyYaml(inboxTaskRecord);
 
-  if (tasksResponse.results.length === 0) {
-    console.log("No inbox tasks found.");
-  } else {
-    tasksResponse.results.forEach((task) => {
-      console.log(task.content);
-    });
-  }
+  console.log("Inbox tasks:");
+  console.log(inboxTasksYaml);
 
-  const sectionsResponse = await api.getSections({ projectId: targetProject.id });
+  const sectionsResponse = await api.getSections({
+    projectId: targetProject.id,
+  });
   const sectionRecord = buildSectionRecord(sectionsResponse.results);
   assertRequiredSectionsExist(sectionRecord);
 
@@ -130,6 +180,68 @@ async function run(apiKey: string, projectName: string): Promise<void> {
 
   console.log("Label record:");
   console.log(JSON.stringify(labelRecord, null, 2));
+
+  const systemPrompt = await loadSystemPrompt();
+  const organizerOutput = await requestTaskOrganization(
+    openaiApiKey,
+    systemPrompt,
+    inboxTasksYaml,
+  );
+
+  console.log("");
+  console.log("LLM structured output:");
+  console.log(JSON.stringify(organizerOutput, null, 2));
+}
+
+/**
+ * Loads the system prompt text from a fixed prompt file.
+ * @returns Prompt contents ready to be sent as model instructions.
+ */
+async function loadSystemPrompt(): Promise<string> {
+  const promptPath = "src/prompts/system.txt";
+  let prompt: string;
+
+  try {
+    prompt = await readFile(promptPath, "utf8");
+  } catch {
+    throw new Error(`Missing prompt file at ${promptPath}.`);
+  }
+
+  if (prompt.trim().length === 0) {
+    throw new Error(`Prompt file at ${promptPath} is empty.`);
+  }
+
+  return prompt;
+}
+
+/**
+ * Sends inbox YAML to OpenAI and parses a structured organizer output.
+ * @param openaiApiKey - OpenAI API key.
+ * @param systemPrompt - System prompt text.
+ * @param inboxTasksYaml - YAML representation of inbox tasks.
+ * @returns Structured output from the model.
+ */
+async function requestTaskOrganization(
+  openaiApiKey: string,
+  systemPrompt: string,
+  inboxTasksYaml: string,
+): Promise<OrganizerOutput> {
+  const openaiClient = new OpenAI({ apiKey: openaiApiKey });
+
+  const response = await openaiClient.responses.parse({
+    model: OPENAI_MODEL,
+    instructions: systemPrompt,
+    input: `Inbox task list in YAML:\n\n${inboxTasksYaml}`,
+    text: {
+      format: zodTextFormat(OrganizerOutputSchema, "inbox_organization_output"),
+    },
+  });
+
+  if (!response.output_parsed) {
+    throw new Error("OpenAI response did not include structured output.");
+  }
+
+  return response.output_parsed;
 }
 
 /**
@@ -227,4 +339,31 @@ function assertRequiredLabelsExist(
   }
 
   throw new Error(`Missing required labels: ${missingLabels.join(", ")}`);
+}
+
+/**
+ * Builds JSON-safe inbox task output.
+ * @param tasks - Active tasks in the user's inbox project.
+ * @returns A JSON object containing task name, ID, and optional description.
+ */
+function buildInboxTaskRecord(tasks: TodoistTask[]): {
+  tasks: Array<{ taskName: string; taskId: string; description?: string }>;
+} {
+  return {
+    tasks: tasks.map((task) => {
+      const baseTask = {
+        taskName: task.content,
+        taskId: task.id,
+      };
+
+      if (!task.description || task.description.trim().length === 0) {
+        return baseTask;
+      }
+
+      return {
+        ...baseTask,
+        description: task.description,
+      };
+    }),
+  };
 }

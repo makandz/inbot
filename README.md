@@ -20,6 +20,9 @@ Set these values in `.env`:
 
 - `TODOIST_API_KEY`: your Todoist API token.
 - `TODOIST_TARGET_PROJECT_NAME`: the project name where organized tasks will be moved.
+- `OPENAI_API_KEY`: your OpenAI API key.
+
+3. Add your system prompt at `src/prompts/system.txt`.
 
 ## Run
 
@@ -36,7 +39,12 @@ npm run build
 npm run start
 ```
 
-The app prints one line per Inbox task, then prints the configured target project and all of its sections with IDs.
+The app prints:
+
+- Inbox tasks as YAML (`taskName`, `taskId`, optional `description`)
+- Configured project and required sections
+- Required labels
+- Structured GPT output for downstream processing
 
 ## Cron Example
 
