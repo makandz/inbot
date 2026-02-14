@@ -53,6 +53,12 @@ const OrganizerOutputSchema = z.object({
       question: z.string().min(1).max(140),
     }),
   ),
+  shopping: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string().min(1),
+    }),
+  ),
 });
 
 type OrganizerOutput = z.infer<typeof OrganizerOutputSchema>;
@@ -66,15 +72,21 @@ void main();
 async function main(): Promise<void> {
   const todoistApiKey = getRequiredEnvVar("TODOIST_API_KEY");
   const targetProjectName = getRequiredEnvVar("TODOIST_TARGET_PROJECT_NAME");
+  const referencesProjectName = getRequiredEnvVar("TODOIST_REFERENCES_PROJECT_NAME");
   const openaiApiKey = getRequiredEnvVar("OPENAI_API_KEY");
 
-  if (!todoistApiKey || !targetProjectName || !openaiApiKey) {
+  if (!todoistApiKey || !targetProjectName || !referencesProjectName || !openaiApiKey) {
     process.exitCode = 1;
     return;
   }
 
   try {
-    await run(todoistApiKey, targetProjectName, openaiApiKey);
+    await run(
+      todoistApiKey,
+      targetProjectName,
+      referencesProjectName,
+      openaiApiKey,
+    );
   } catch (error: unknown) {
     console.error(formatErrorMessage(error));
     process.exitCode = 1;
@@ -114,12 +126,14 @@ function getRequiredEnvVar(variableName: string): string | undefined {
  * Fetches inbox tasks and target project details from Todoist.
  * @param apiKey - Todoist API token.
  * @param projectName - Name of the project where organized tasks will be placed.
+ * @param referencesProjectName - Name of the read-only references project.
  * @param openaiApiKey - OpenAI API key used for task organization output.
  * @returns Resolves when all task and project details have been printed.
  */
 async function run(
   apiKey: string,
   projectName: string,
+  referencesProjectName: string,
   openaiApiKey: string,
 ): Promise<void> {
   const api = new TodoistApi(apiKey);
@@ -140,6 +154,23 @@ async function run(
   if (!targetProject) {
     throw new Error(`Could not find project named "${projectName}"`);
   }
+
+  const referencesProject = projectsResponse.results.find(
+    (project) => project.name.toLowerCase() === referencesProjectName.toLowerCase(),
+  );
+
+  if (!referencesProject) {
+    throw new Error(`Could not find project named "${referencesProjectName}"`);
+  }
+
+  const referencesTasksResponse = await api.getTasks({
+    projectId: referencesProject.id,
+  });
+  const referenceNotesRecord = buildReferenceNotesRecord(referencesTasksResponse.results);
+  const referencesYaml = stringifyYaml(referenceNotesRecord);
+
+  console.log("Reference notes:");
+  console.log(referencesYaml);
 
   const tasksResponse = await api.getTasks({ projectId: inboxProject.id });
   const inboxTaskRecord = buildInboxTaskRecord(tasksResponse.results);
@@ -185,6 +216,7 @@ async function run(
   const organizerOutput = await requestTaskOrganization(
     openaiApiKey,
     systemPrompt,
+    referencesYaml,
     inboxTasksYaml,
   );
 
@@ -218,12 +250,14 @@ async function loadSystemPrompt(): Promise<string> {
  * Sends inbox YAML to OpenAI and parses a structured organizer output.
  * @param openaiApiKey - OpenAI API key.
  * @param systemPrompt - System prompt text.
+ * @param referencesYaml - YAML representation of reference notes.
  * @param inboxTasksYaml - YAML representation of inbox tasks.
  * @returns Structured output from the model.
  */
 async function requestTaskOrganization(
   openaiApiKey: string,
   systemPrompt: string,
+  referencesYaml: string,
   inboxTasksYaml: string,
 ): Promise<OrganizerOutput> {
   const openaiClient = new OpenAI({ apiKey: openaiApiKey });
@@ -231,7 +265,7 @@ async function requestTaskOrganization(
   const response = await openaiClient.responses.parse({
     model: OPENAI_MODEL,
     instructions: systemPrompt,
-    input: `Inbox task list in YAML:\n\n${inboxTasksYaml}`,
+    input: `Reference notes in YAML:\n\n${referencesYaml}\n\nInbox task list in YAML:\n\n${inboxTasksYaml}`,
     text: {
       format: zodTextFormat(OrganizerOutputSchema, "inbox_organization_output"),
     },
@@ -365,5 +399,20 @@ function buildInboxTaskRecord(tasks: TodoistTask[]): {
         description: task.description,
       };
     }),
+  };
+}
+
+/**
+ * Builds YAML-safe reference notes payload from project tasks.
+ * @param tasks - Active tasks from the references project.
+ * @returns A record containing reference note IDs and titles.
+ */
+function buildReferenceNotesRecord(tasks: TodoistTask[]): {
+  reference_notes: Array<{ title: string }>;
+} {
+  return {
+    reference_notes: tasks.map((task) => ({
+      title: task.content,
+    })),
   };
 }

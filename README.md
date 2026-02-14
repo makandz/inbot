@@ -20,6 +20,7 @@ Set these values in `.env`:
 
 - `TODOIST_API_KEY`: your Todoist API token.
 - `TODOIST_TARGET_PROJECT_NAME`: the project name where organized tasks will be moved.
+- `TODOIST_REFERENCES_PROJECT_NAME`: the project containing read-only reference notes.
 - `OPENAI_API_KEY`: your OpenAI API key.
 
 3. Add your system prompt at `src/prompts/system.txt`.
@@ -42,6 +43,7 @@ npm run start
 The app prints:
 
 - Inbox tasks as YAML (`taskName`, `taskId`, optional `description`)
+- Reference notes as YAML (from your References project)
 - Configured project and required sections
 - Required labels
 - Structured GPT output for downstream processing
