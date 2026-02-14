@@ -62,6 +62,17 @@ const OrganizerOutputSchema = z.object({
 });
 
 type OrganizerOutput = z.infer<typeof OrganizerOutputSchema>;
+type OrganizerSection = OrganizerOutput["to_move"][number]["section"];
+
+type OrganizerApplyArgs = {
+  api: TodoistApi;
+  organizerOutput: OrganizerOutput;
+  actionableInboxTasks: TodoistTask[];
+  targetProjectId: string;
+  shoppingProjectId: string;
+  sectionRecord: CompleteSectionRecord;
+  clarifyLabelName: string;
+};
 
 void main();
 
@@ -73,9 +84,16 @@ async function main(): Promise<void> {
   const todoistApiKey = getRequiredEnvVar("TODOIST_API_KEY");
   const targetProjectName = getRequiredEnvVar("TODOIST_TARGET_PROJECT_NAME");
   const referencesProjectName = getRequiredEnvVar("TODOIST_REFERENCES_PROJECT_NAME");
+  const shoppingProjectName = getRequiredEnvVar("TODOIST_SHOPPING_PROJECT_NAME");
   const openaiApiKey = getRequiredEnvVar("OPENAI_API_KEY");
 
-  if (!todoistApiKey || !targetProjectName || !referencesProjectName || !openaiApiKey) {
+  if (
+    !todoistApiKey ||
+    !targetProjectName ||
+    !referencesProjectName ||
+    !shoppingProjectName ||
+    !openaiApiKey
+  ) {
     process.exitCode = 1;
     return;
   }
@@ -85,6 +103,7 @@ async function main(): Promise<void> {
       todoistApiKey,
       targetProjectName,
       referencesProjectName,
+      shoppingProjectName,
       openaiApiKey,
     );
   } catch (error: unknown) {
@@ -127,6 +146,7 @@ function getRequiredEnvVar(variableName: string): string | undefined {
  * @param apiKey - Todoist API token.
  * @param projectName - Name of the project where organized tasks will be placed.
  * @param referencesProjectName - Name of the read-only references project.
+ * @param shoppingProjectName - Name of the shopping project used for shopping tasks.
  * @param openaiApiKey - OpenAI API key used for task organization output.
  * @returns Resolves when all task and project details have been printed.
  */
@@ -134,6 +154,7 @@ async function run(
   apiKey: string,
   projectName: string,
   referencesProjectName: string,
+  shoppingProjectName: string,
   openaiApiKey: string,
 ): Promise<void> {
   const api = new TodoistApi(apiKey);
@@ -163,21 +184,18 @@ async function run(
     throw new Error(`Could not find project named "${referencesProjectName}"`);
   }
 
-  const referencesTasksResponse = await api.getTasks({
-    projectId: referencesProject.id,
-  });
-  const referenceNotesRecord = buildReferenceNotesRecord(referencesTasksResponse.results);
-  const referencesYaml = stringifyYaml(referenceNotesRecord);
+  const shoppingProject = projectsResponse.results.find(
+    (project) => project.name.toLowerCase() === shoppingProjectName.toLowerCase(),
+  );
 
-  console.log("Reference notes:");
-  console.log(referencesYaml);
+  if (!shoppingProject) {
+    throw new Error(`Could not find project named "${shoppingProjectName}"`);
+  }
 
-  const tasksResponse = await api.getTasks({ projectId: inboxProject.id });
-  const inboxTaskRecord = buildInboxTaskRecord(tasksResponse.results);
-  const inboxTasksYaml = stringifyYaml(inboxTaskRecord);
+  const shoppingProjectId = shoppingProject.id;
 
-  console.log("Inbox tasks:");
-  console.log(inboxTasksYaml);
+  console.log("");
+  console.log(`Shopping project: ${shoppingProject.name} (${shoppingProjectId})`);
 
   const sectionsResponse = await api.getSections({
     projectId: targetProject.id,
@@ -212,6 +230,30 @@ async function run(
   console.log("Label record:");
   console.log(JSON.stringify(labelRecord, null, 2));
 
+  const referencesTasksResponse = await api.getTasks({
+    projectId: referencesProject.id,
+  });
+  const referenceNotesRecord = buildReferenceNotesRecord(referencesTasksResponse.results);
+  const referencesYaml = stringifyYaml(referenceNotesRecord);
+
+  console.log("Reference notes:");
+  console.log(referencesYaml);
+
+  const tasksResponse = await api.getTasks({ projectId: inboxProject.id });
+  const actionableInboxTasks = tasksResponse.results.filter(
+    (task) => !hasLabel(task, labelRecord.clarify.name),
+  );
+  const inboxTaskRecord = buildInboxTaskRecord(actionableInboxTasks);
+  const inboxTasksYaml = stringifyYaml(inboxTaskRecord);
+
+  console.log("Inbox tasks:");
+  console.log(inboxTasksYaml);
+
+  if (actionableInboxTasks.length === 0) {
+    console.log("No actionable inbox tasks found.");
+    return;
+  }
+
   const systemPrompt = await loadSystemPrompt();
   const organizerOutput = await requestTaskOrganization(
     openaiApiKey,
@@ -223,6 +265,16 @@ async function run(
   console.log("");
   console.log("LLM structured output:");
   console.log(JSON.stringify(organizerOutput, null, 2));
+
+  await applyOrganizerOutput({
+    api,
+    organizerOutput,
+    actionableInboxTasks,
+    targetProjectId: targetProject.id,
+    shoppingProjectId,
+    sectionRecord,
+    clarifyLabelName: labelRecord.clarify.name,
+  });
 }
 
 /**
@@ -275,7 +327,346 @@ async function requestTaskOrganization(
     throw new Error("OpenAI response did not include structured output.");
   }
 
-  return response.output_parsed;
+  return OrganizerOutputSchema.parse(response.output_parsed);
+}
+
+/**
+ * Applies the parsed organizer output by modifying existing Todoist tasks.
+ * @param args - Inputs required to apply model output safely.
+ * @returns Resolves when all requested task updates have been applied.
+ */
+async function applyOrganizerOutput(args: OrganizerApplyArgs): Promise<void> {
+  const {
+    api,
+    organizerOutput,
+    actionableInboxTasks,
+    targetProjectId,
+    shoppingProjectId,
+    sectionRecord,
+    clarifyLabelName,
+  } = args;
+
+  const taskMap = new Map(actionableInboxTasks.map((task) => [task.id, task]));
+
+  validateOrganizerOutput(organizerOutput, taskMap);
+
+  for (const toMoveTask of organizerOutput.to_move) {
+    const task = getTaskFromMap(taskMap, toMoveTask.id);
+    await applyToMoveAction({
+      api,
+      task,
+      toMoveTask,
+      targetProjectId,
+      sectionRecord,
+    });
+  }
+
+  for (const shoppingTask of organizerOutput.shopping) {
+    const task = getTaskFromMap(taskMap, shoppingTask.id);
+    await applyShoppingAction({
+      api,
+      task,
+      shoppingTask,
+      shoppingProjectId,
+    });
+  }
+
+  for (const clarificationTask of organizerOutput.needs_clarification) {
+    const task = getTaskFromMap(taskMap, clarificationTask.id);
+    await applyClarificationAction({
+      api,
+      task,
+      clarificationTask,
+      clarifyLabelName,
+    });
+  }
+}
+
+/**
+ * Validates model output task coverage before mutating Todoist data.
+ * @param organizerOutput - Structured response from the model.
+ * @param taskMap - Actionable inbox task map keyed by task ID.
+ * @returns Nothing; throws on duplicate, unknown, or missing task IDs.
+ */
+function validateOrganizerOutput(
+  organizerOutput: OrganizerOutput,
+  taskMap: Map<string, TodoistTask>,
+): void {
+  const allIds = [
+    ...organizerOutput.to_move.map((task) => task.id),
+    ...organizerOutput.shopping.map((task) => task.id),
+    ...organizerOutput.needs_clarification.map((task) => task.id),
+  ];
+
+  const duplicateIds = allIds.filter((id, index) => allIds.indexOf(id) !== index);
+  if (duplicateIds.length > 0) {
+    throw new Error(
+      `OpenAI response contains duplicate task IDs: ${Array.from(new Set(duplicateIds)).join(", ")}`,
+    );
+  }
+
+  const unknownIds = allIds.filter((id) => !taskMap.has(id));
+  if (unknownIds.length > 0) {
+    throw new Error(
+      `OpenAI response contains unknown task IDs: ${Array.from(new Set(unknownIds)).join(", ")}`,
+    );
+  }
+
+  if (allIds.length !== taskMap.size) {
+    const assignedIds = new Set(allIds);
+    const missingIds = Array.from(taskMap.keys()).filter((id) => !assignedIds.has(id));
+    throw new Error(
+      `OpenAI response did not cover all actionable inbox tasks. Missing IDs: ${missingIds.join(", ")}`,
+    );
+  }
+}
+
+/**
+ * Returns a task by ID from the actionable inbox task map.
+ * @param taskMap - Actionable inbox tasks keyed by ID.
+ * @param taskId - Task ID to resolve.
+ * @returns The matching task.
+ */
+function getTaskFromMap(taskMap: Map<string, TodoistTask>, taskId: string): TodoistTask {
+  const task = taskMap.get(taskId);
+
+  if (!task) {
+    throw new Error(`Task ID ${taskId} was not found in actionable inbox tasks.`);
+  }
+
+  return task;
+}
+
+/**
+ * Applies a `to_move` task mutation.
+ * @param args - Data required to move and update a task.
+ * @returns Resolves when move, update, and audit comment are complete.
+ */
+async function applyToMoveAction(args: {
+  api: TodoistApi;
+  task: TodoistTask;
+  toMoveTask: OrganizerOutput["to_move"][number];
+  targetProjectId: string;
+  sectionRecord: CompleteSectionRecord;
+}): Promise<void> {
+  const { api, task, toMoveTask, targetProjectId, sectionRecord } = args;
+
+  const finalSection = resolveFinalSection(task, toMoveTask.section);
+  const labelsToAdd = toMoveTask.add_labels ?? [];
+  const mergedLabels = mergeLabels(task.labels, labelsToAdd);
+
+  if (finalSection === "no_section") {
+    await api.moveTask(task.id, { projectId: targetProjectId });
+  } else {
+    await api.moveTask(task.id, { sectionId: sectionRecord[finalSection].id });
+  }
+
+  await api.updateTask(task.id, {
+    content: toMoveTask.title,
+    description: toMoveTask.description ?? "",
+    labels: mergedLabels,
+    ...(toMoveTask.priority !== null ? { priority: toMoveTask.priority } : {}),
+  });
+
+  await api.addComment({
+    taskId: task.id,
+    content: buildToMoveAuditComment(task, finalSection, labelsToAdd, toMoveTask.priority),
+  });
+}
+
+/**
+ * Applies a `shopping` task mutation.
+ * @param args - Data required to move and update a shopping task.
+ * @returns Resolves when move, update, and audit comment are complete.
+ */
+async function applyShoppingAction(args: {
+  api: TodoistApi;
+  task: TodoistTask;
+  shoppingTask: OrganizerOutput["shopping"][number];
+  shoppingProjectId: string;
+}): Promise<void> {
+  const { api, task, shoppingTask, shoppingProjectId } = args;
+  const shoppingTitle = capitalizeFirstLetter(shoppingTask.title.trim());
+
+  await api.moveTask(task.id, { projectId: shoppingProjectId });
+  await api.updateTask(task.id, { content: shoppingTitle });
+
+  await api.addComment({
+    taskId: task.id,
+    content: buildShoppingAuditComment(task),
+  });
+}
+
+/**
+ * Applies a `needs_clarification` task mutation.
+ * @param args - Data required to label and comment a clarification task.
+ * @returns Resolves when updates and comment are complete.
+ */
+async function applyClarificationAction(args: {
+  api: TodoistApi;
+  task: TodoistTask;
+  clarificationTask: OrganizerOutput["needs_clarification"][number];
+  clarifyLabelName: string;
+}): Promise<void> {
+  const { api, task, clarificationTask, clarifyLabelName } = args;
+  const mergedLabels = mergeLabels(task.labels, [clarifyLabelName]);
+
+  await api.updateTask(task.id, { labels: mergedLabels });
+
+  await api.addComment({
+    taskId: task.id,
+    content: buildClarificationComment(task, clarifyLabelName, clarificationTask.question),
+  });
+}
+
+/**
+ * Resolves the final section for a task based on due-date rules.
+ * @param task - Current Todoist task state.
+ * @param requestedSection - Section requested by model output.
+ * @returns The final section that should be applied.
+ */
+function resolveFinalSection(task: TodoistTask, requestedSection: OrganizerSection): OrganizerSection {
+  if (task.due) {
+    return "no_section";
+  }
+
+  return requestedSection;
+}
+
+/**
+ * Merges labels while preserving existing labels and preventing duplicates.
+ * @param existingLabels - Labels currently on the task.
+ * @param labelsToAdd - Labels that should be added.
+ * @returns A deduplicated label array for task updates.
+ */
+function mergeLabels(existingLabels: string[], labelsToAdd: string[]): string[] {
+  const mergedLabels = [...existingLabels];
+  const existingLabelSet = new Set(existingLabels.map((label) => label.toLowerCase()));
+
+  labelsToAdd.forEach((label) => {
+    const normalizedLabel = label.toLowerCase();
+
+    if (existingLabelSet.has(normalizedLabel)) {
+      return;
+    }
+
+    mergedLabels.push(label);
+    existingLabelSet.add(normalizedLabel);
+  });
+
+  return mergedLabels;
+}
+
+/**
+ * Checks whether a task currently has a given label.
+ * @param task - Todoist task to inspect.
+ * @param labelName - Label name to check for.
+ * @returns True when the label already exists on the task.
+ */
+function hasLabel(task: TodoistTask, labelName: string): boolean {
+  return task.labels.some((label) => label.toLowerCase() === labelName.toLowerCase());
+}
+
+/**
+ * Creates an audit comment for `to_move` mutations.
+ * @param task - Original task before updates.
+ * @param finalSection - Section selected after due-date override rules.
+ * @param labelsToAdd - Labels requested to be added.
+ * @param priority - Priority requested by model output.
+ * @returns Comment body for Todoist.
+ */
+function buildToMoveAuditComment(
+  task: TodoistTask,
+  finalSection: OrganizerSection,
+  labelsToAdd: string[],
+  priority: 1 | 2 | 3 | 4 | null,
+): string {
+  const labelsSummary = labelsToAdd.length > 0 ? labelsToAdd.join(", ") : "none";
+  const prioritySummary = priority === null ? "none" : String(priority);
+
+  return buildAuditComment([
+    ["Old title", task.content],
+    ["Old description", formatDescription(task.description)],
+    ["Moved section", finalSection],
+    ["Labels added", labelsSummary],
+    ["Priority assigned", prioritySummary],
+  ]);
+}
+
+/**
+ * Creates an audit comment for shopping task mutations.
+ * @param task - Original task before updates.
+ * @returns Comment body for Todoist.
+ */
+function buildShoppingAuditComment(task: TodoistTask): string {
+  return buildAuditComment([
+    ["Old title", task.content],
+    ["Old description", formatDescription(task.description)],
+    ["Moved section", "no_section"],
+    ["Labels added", "none"],
+    ["Priority assigned", "none"],
+  ]);
+}
+
+/**
+ * Creates a clarification comment that includes audit details.
+ * @param task - Original task before updates.
+ * @param clarifyLabelName - Clarify label name that was applied.
+ * @param question - Clarification question generated by the model.
+ * @returns Comment body for Todoist.
+ */
+function buildClarificationComment(
+  task: TodoistTask,
+  clarifyLabelName: string,
+  question: string,
+): string {
+  return [
+    buildAuditComment([
+      ["Old title", task.content],
+      ["Old description", formatDescription(task.description)],
+      ["Moved section", "unchanged"],
+      ["Labels added", clarifyLabelName],
+      ["Priority assigned", "none"],
+    ]),
+    `**Clarification needed**: ${question}`,
+  ].join("\n\n");
+}
+
+/**
+ * Builds a standardized audit comment body.
+ * @param details - Key/value detail lines to include after the header.
+ * @returns Formatted audit comment text.
+ */
+function buildAuditComment(details: Array<[string, string]>): string {
+  const detailLines = details.map(([key, value]) => `**${key}**: ${value}`);
+
+  return ["Organized!", "", ...detailLines].join("\n");
+}
+
+/**
+ * Formats task descriptions for audit comment readability.
+ * @param description - Task description from Todoist.
+ * @returns A printable description value.
+ */
+function formatDescription(description: string): string {
+  if (description.trim().length === 0) {
+    return "(empty)";
+  }
+
+  return description;
+}
+
+/**
+ * Capitalizes the first character in a string.
+ * @param value - Source value.
+ * @returns Value with an uppercase first character.
+ */
+function capitalizeFirstLetter(value: string): string {
+  if (value.length === 0) {
+    return value;
+  }
+
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 /**
@@ -405,7 +796,7 @@ function buildInboxTaskRecord(tasks: TodoistTask[]): {
 /**
  * Builds YAML-safe reference notes payload from project tasks.
  * @param tasks - Active tasks from the references project.
- * @returns A record containing reference note IDs and titles.
+ * @returns A record containing reference note titles.
  */
 function buildReferenceNotesRecord(tasks: TodoistTask[]): {
   reference_notes: Array<{ title: string }>;
